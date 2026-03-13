@@ -2,7 +2,7 @@ from .models import AnalysisReport, AnalysisStatus, CriteriaResult, FeatureResul
 from .reporting import report_to_dict, report_to_html, report_to_json, report_to_markdown, report_to_table
 from .specs_parser import SpecsParser
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "AnalysisError",
