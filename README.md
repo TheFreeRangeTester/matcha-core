@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/branding/matcha-logo.png" alt="Matcha logo" width="180">
+  <img src="https://raw.githubusercontent.com/TheFreeRangeTester/matcha-core/main/assets/branding/matcha-logo.png" alt="Matcha logo" width="180">
 </p>
 
 # Matcha Core
