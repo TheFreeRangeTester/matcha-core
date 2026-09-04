@@ -49,6 +49,7 @@ SKIP_DIRS = {
 }
 
 SKIP_FEATURE_STATUSES = {
+    "draft",
     "todo",
     "planned",
     "not started",
@@ -85,6 +86,7 @@ class RepositoryAnalyzer:
         self,
         repo_path: str,
         specs_path: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
         progress_callback: Optional[ProgressCallback] = None,
         source: Optional[str] = None,
         commit_hash: Optional[str] = None,
@@ -98,6 +100,10 @@ class RepositoryAnalyzer:
         parsed_features = self.parser.parse(resolved_specs_path)
         if not parsed_features:
             raise AnalysisError("No features found in SPECS.md")
+        parsed_features = filter_features(parsed_features, feature_ids)
+        if not parsed_features:
+            requested = ", ".join(feature_ids or [])
+            raise AnalysisError(f"Requested feature IDs were not found in SPECS.md: {requested}")
 
         file_index = build_file_index(repo_path)
         _notify(progress_callback, AnalysisStatus.ANALYZING.value)
@@ -108,6 +114,9 @@ class RepositoryAnalyzer:
         different = 0
         not_implemented = 0
         not_specified = 0
+        skipped = 0
+        inconclusive = 0
+        analysis_failed = 0
         all_confidences: List[float] = []
         debug_file = None
         if debug_output_path:
@@ -168,22 +177,33 @@ class RepositoryAnalyzer:
                         short_explanation=evaluation["short_explanation"],
                         detailed_explanation=evaluation["detailed_explanation"],
                         code_snippets=evaluation["code_snippets"],
+                        analysis_mode=evaluation["analysis_mode"],
+                        error=evaluation["error"],
                     )
                     criteria_results.append(criteria_result)
 
                     status_value = criteria_result.implementation_status
                     feature_statuses.append(status_value)
                     feature_confidences.append(criteria_result.confidence)
-                    all_confidences.append(criteria_result.confidence)
 
                     if status_value == ImplementationStatus.IMPLEMENTED_AS_EXPECTED.value:
                         implemented += 1
+                        all_confidences.append(criteria_result.confidence)
                     elif status_value == ImplementationStatus.IMPLEMENTED_DIFFERENTLY.value:
                         different += 1
+                        all_confidences.append(criteria_result.confidence)
                     elif status_value == ImplementationStatus.NOT_IMPLEMENTED.value:
                         not_implemented += 1
-                    else:
+                        all_confidences.append(criteria_result.confidence)
+                    elif status_value == ImplementationStatus.NOT_SPECIFIED.value:
                         not_specified += 1
+                        all_confidences.append(criteria_result.confidence)
+                    elif status_value == ImplementationStatus.SKIPPED.value:
+                        skipped += 1
+                    elif status_value == ImplementationStatus.INCONCLUSIVE.value:
+                        inconclusive += 1
+                    else:
+                        analysis_failed += 1
 
                     if debug_file:
                         debug_record["result"] = {
@@ -219,6 +239,9 @@ class RepositoryAnalyzer:
                 different_count=different,
                 not_implemented_count=not_implemented,
                 not_specified_count=not_specified,
+                skipped_count=skipped,
+                inconclusive_count=inconclusive,
+                analysis_failed_count=analysis_failed,
                 global_confidence=sum(all_confidences) / len(all_confidences) if all_confidences else 0.0,
             )
         finally:
@@ -247,6 +270,7 @@ class RepositoryAnalyzer:
             commit_hash = repo.head.commit.hexsha[:7]
             return self.analyze_path(
                 repo_path=repo_path,
+                feature_ids=None,
                 progress_callback=progress_callback,
                 source=github_url,
                 commit_hash=commit_hash,
@@ -283,35 +307,57 @@ def _notify(progress_callback: Optional[ProgressCallback], status: str) -> None:
         progress_callback(status)
 
 
+def filter_features(parsed_features: List[Dict[str, Any]], feature_ids: Optional[List[str]]) -> List[Dict[str, Any]]:
+    if not feature_ids:
+        return parsed_features
+
+    normalized_ids = {feature_id.strip().lower() for feature_id in feature_ids if feature_id.strip()}
+    return [
+        feature
+        for feature in parsed_features
+        if (feature.get("id") or "").strip().lower() in normalized_ids
+    ]
+
+
 def skipped_evaluation(feature_status: str) -> Dict[str, Any]:
     return {
-        "status": ImplementationStatus.NOT_IMPLEMENTED.value,
-        "confidence": 1.0,
+        "status": ImplementationStatus.SKIPPED.value,
+        "confidence": 0.0,
         "short_explanation": f"Feature marked as '{feature_status}' in SPECS.md - skipped analysis.",
         "detailed_explanation": (
             f"This feature is listed as '{feature_status}' in the specification and was not analyzed. "
             "Update the feature status to 'Completed' or 'Done' in SPECS.md to include it in the analysis."
         ),
         "code_snippets": "",
+        "analysis_mode": "skipped_planned",
+        "error": None,
     }
 
 
 def normalize_evaluation(evaluation: Dict[str, Any]) -> Dict[str, Any]:
     valid_statuses = {status.value for status in ImplementationStatus}
-    status = evaluation.get("status", ImplementationStatus.NOT_IMPLEMENTED.value)
+    status = evaluation.get("status", ImplementationStatus.ANALYSIS_FAILED.value)
+    invalid_status_error = None
     if status not in valid_statuses:
-        status = ImplementationStatus.NOT_IMPLEMENTED.value
+        invalid_status_error = f"Evaluator returned an invalid status: {status!r}"
+        status = ImplementationStatus.ANALYSIS_FAILED.value
 
     confidence = evaluation.get("confidence", 0.0)
     if not isinstance(confidence, (int, float)):
+        confidence = 0.0
+    if invalid_status_error:
         confidence = 0.0
 
     return {
         "status": status,
         "confidence": max(0.0, min(1.0, float(confidence))),
-        "short_explanation": evaluation.get("short_explanation", ""),
-        "detailed_explanation": evaluation.get("detailed_explanation", ""),
+        "short_explanation": evaluation.get("short_explanation", "") or (
+            "The criterion could not be evaluated" if invalid_status_error else ""
+        ),
+        "detailed_explanation": invalid_status_error or evaluation.get("detailed_explanation", ""),
         "code_snippets": evaluation.get("code_snippets", ""),
+        "analysis_mode": "analysis_failed" if invalid_status_error else evaluation.get("analysis_mode", "model"),
+        "error": invalid_status_error or evaluation.get("error"),
     }
 
 
@@ -952,8 +998,14 @@ def extract_relevant_lines(content: str, keywords: Set[str]) -> str:
 
 def determine_feature_status(statuses: List[str]) -> str:
     if not statuses:
-        return ImplementationStatus.NOT_IMPLEMENTED.value
+        return ImplementationStatus.INCONCLUSIVE.value
 
+    if all(status == ImplementationStatus.SKIPPED.value for status in statuses):
+        return ImplementationStatus.SKIPPED.value
+    if any(status == ImplementationStatus.ANALYSIS_FAILED.value for status in statuses):
+        return ImplementationStatus.ANALYSIS_FAILED.value
+    if any(status == ImplementationStatus.INCONCLUSIVE.value for status in statuses):
+        return ImplementationStatus.INCONCLUSIVE.value
     if all(status == ImplementationStatus.IMPLEMENTED_AS_EXPECTED.value for status in statuses):
         return ImplementationStatus.IMPLEMENTED_AS_EXPECTED.value
     if all(status == ImplementationStatus.NOT_IMPLEMENTED.value for status in statuses):

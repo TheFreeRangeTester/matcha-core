@@ -34,7 +34,6 @@ Acceptance Criteria:
 
 ## Full Example
 
-```md
 # Project Specs
 
 ## FEAT-1 User authentication
@@ -77,7 +76,6 @@ Acceptance Criteria:
 Acceptance Criteria:
 - Users can sign in with Google OAuth.
 - Organization admins can restrict login by email domain.
-```
 
 ## Best Practices
 

@@ -47,6 +47,7 @@ class ReportingTests(unittest.TestCase):
         rendered = report_to_json(sample_report())
         self.assertIn('"source": "demo-repo"', rendered)
         self.assertIn('"feature_id": "FEAT-1"', rendered)
+        self.assertIn('"schema_version": "1.0"', rendered)
 
     def test_report_to_markdown_contains_summary(self):
         rendered = report_to_markdown(sample_report())
@@ -65,6 +66,29 @@ class ReportingTests(unittest.TestCase):
         self.assertIn('data-feature-status="implemented_as_expected"', rendered)
         self.assertIn('data-criteria-status="implemented_as_expected"', rendered)
         self.assertIn('data-search-text="AC-1 Render &lt;escaped&gt; content correctly.', rendered)
+
+    def test_report_to_html_formats_structured_feature_description(self):
+        report = sample_report()
+        report.features[0].description = (
+            "Posting guardrails and crisis prompt\n"
+            "Priority: High\n"
+            "Status: Done\n"
+            "Related Components: Hubman/ViewModels/HubmanViewModel.swift, Hubman/Views/ContentView.swift\n"
+            "Acceptance Criteria:\n"
+            "The active post flow blocks submissions that contain hashtags, links, email addresses, or phone numbers before insert.\n"
+            "The database trigger validatebublcontent_trigger rejects posts that contain external links, email addresses, phone numbers, or @ handles."
+        )
+        rendered = report_to_html(report)
+
+        self.assertIn('class="feature-specs"', rendered)
+        self.assertIn('<span class="feature-spec-label">Summary</span>', rendered)
+        self.assertIn("Posting guardrails and crisis prompt", rendered)
+        self.assertIn('<span class="feature-spec-label">Related Components</span>', rendered)
+        self.assertIn("Hubman/ViewModels/HubmanViewModel.swift", rendered)
+        self.assertIn('<span class="feature-spec-label">Acceptance Criteria</span>', rendered)
+        self.assertIn("<li>The active post flow blocks submissions", rendered)
+        self.assertIn("<li>The database trigger validatebublcontent_trigger rejects posts", rendered)
+        self.assertNotIn('class="feature-description">Priority: High', rendered)
 
     def test_report_to_table_renders_ascii_summary(self):
         rendered = report_to_table(sample_report())

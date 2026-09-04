@@ -2,7 +2,14 @@ import re
 from typing import Any, Dict, List
 
 
+class SpecsValidationError(ValueError):
+    """Raised when a specs document cannot be evaluated deterministically."""
+
+
 class SpecsParser:
+    def __init__(self, strict: bool = True):
+        self.strict = strict
+
     def _clean_markdown(self, text: str) -> str:
         if not text:
             return ""
@@ -44,28 +51,57 @@ class SpecsParser:
 
     def parse(self, specs_path: str) -> List[Dict[str, Any]]:
         with open(specs_path, "r", encoding="utf-8") as file:
-            content = file.read()
+            content = self._strip_fenced_code_blocks(file.read())
 
         features = self._parse_structured_features(content)
 
-        if not features or all(len(f.get("acceptance_criteria", [])) == 0 for f in features):
+        if not features and not self.strict:
             features = self._parse_flexible_format(content)
 
-        if not features:
+        if not features and not self.strict:
             features = self._fallback_parse(content)
 
+        self._validate(features)
         return features
+
+    def _strip_fenced_code_blocks(self, content: str) -> str:
+        return re.sub(r"(?ms)^\s*(```|~~~).*?^\s*\1\s*$", "", content)
+
+    def _validate(self, features: List[Dict[str, Any]]) -> None:
+        if not features:
+            raise SpecsValidationError(
+                "No feature sections found. Use headings such as '## FEAT-1 Feature name'."
+            )
+
+        seen_ids = set()
+        duplicate_ids = set()
+        missing_criteria = []
+        for feature in features:
+            feature_id = (feature.get("id") or "").strip().lower()
+            if feature_id in seen_ids:
+                duplicate_ids.add(feature.get("id") or "<missing>")
+            seen_ids.add(feature_id)
+            if not feature.get("acceptance_criteria"):
+                missing_criteria.append(feature.get("id") or "<missing>")
+
+        issues = []
+        if duplicate_ids:
+            issues.append(f"duplicate feature IDs: {', '.join(sorted(duplicate_ids))}")
+        if missing_criteria:
+            issues.append(f"features without acceptance criteria: {', '.join(missing_criteria)}")
+        if issues:
+            raise SpecsValidationError("Invalid SPECS.md: " + "; ".join(issues))
 
     def _parse_structured_features(self, content: str) -> List[Dict[str, Any]]:
         features = []
 
         feature_patterns = [
-            r"###\s*(FEAT-\d+|Feature\s*\d+|[A-Z]+-\d+)[:\s\-]*(.+?)(?=###|\Z)",
-            r"##\s*(FEAT-\d+|Feature\s*\d+)[:\s\-]*(.+?)(?=##\s*[A-Z]|\Z)",
+            r"^###(?!#)\s*(FEAT-\d+|Feature\s*\d+|[A-Z]+-\d+)[:\s\-]*(.+?)(?=^###(?!#)|\Z)",
+            r"^##(?!#)\s*(FEAT-\d+|Feature\s*\d+|[A-Z]+-\d+)[:\s\-]*(.+?)(?=^##(?!#)|\Z)",
         ]
 
         for pattern in feature_patterns:
-            matches = re.findall(pattern, content, re.DOTALL | re.IGNORECASE)
+            matches = re.findall(pattern, content, re.DOTALL | re.IGNORECASE | re.MULTILINE)
             for match in matches:
                 feature_id = match[0].strip()
                 feature_content = match[1].strip() if len(match) > 1 else ""

@@ -1,0 +1,30 @@
+version: 1
+
+# Definitive findings that violate this gate.
+fail_on:
+  - not_implemented
+  - implemented_differently
+  - not_specified
+
+# Use "*" to evaluate every priority.
+priorities:
+  - critical
+  - high
+
+# Findings below this confidence make the gate inconclusive rather than passing.
+min_confidence: 0.75
+
+# "block" returns exit code 20 when analysis is incomplete. "ignore" allows it.
+on_inconclusive: block
+
+# Optional. Relative paths resolve from this policy file.
+# baseline: baseline.json
+
+# Temporary exceptions. Omitting criteria applies the rule to the whole feature.
+allow: []
+#  - feature: FEAT-123
+#    criteria: AC-2
+#    statuses:
+#      - not_implemented
+#    expires: 2026-12-31
+#    reason: Accepted migration gap with an owner and deadline

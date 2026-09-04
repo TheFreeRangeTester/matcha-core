@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from dataclasses import asdict
 
 from .models import AnalysisReport
@@ -21,6 +22,7 @@ def report_to_markdown(report: AnalysisReport) -> str:
         "",
         f"- Source: `{report.source}`",
         f"- Specs: `{report.specs_path}`",
+        f"- Schema: `{report.schema_version}`",
         f"- Commit: `{report.commit_hash or 'N/A'}`",
         f"- Features: `{report.total_features}`",
         f"- Criteria: `{report.total_criteria}`",
@@ -28,6 +30,9 @@ def report_to_markdown(report: AnalysisReport) -> str:
         f"- Different: `{report.different_count}`",
         f"- Not implemented: `{report.not_implemented_count}`",
         f"- Not specified: `{report.not_specified_count}`",
+        f"- Skipped: `{report.skipped_count}`",
+        f"- Inconclusive: `{report.inconclusive_count}`",
+        f"- Analysis failed: `{report.analysis_failed_count}`",
         f"- Global confidence: `{round(report.global_confidence * 100)}%`",
         "",
     ]
@@ -60,6 +65,9 @@ def report_to_markdown(report: AnalysisReport) -> str:
             )
             if criteria.short_explanation:
                 lines.append(f"- Summary: {criteria.short_explanation}")
+            lines.append(f"- Analysis mode: `{criteria.analysis_mode}`")
+            if criteria.error:
+                lines.append(f"- Error: {criteria.error}")
             if criteria.referenced_files:
                 files = ", ".join(f"`{path}`" for path in criteria.referenced_files)
                 lines.append(f"- Referenced files: {files}")
@@ -344,6 +352,50 @@ def report_to_html(report: AnalysisReport) -> str:
       color: var(--muted);
     }}
 
+    .feature-specs {{
+      display: grid;
+      gap: 14px;
+      margin: 0 0 16px;
+    }}
+
+    .feature-spec-block {{
+      background: rgba(245, 239, 230, 0.55);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 14px 16px;
+    }}
+
+    .feature-spec-label {{
+      display: block;
+      margin-bottom: 8px;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      font-size: 0.72rem;
+    }}
+
+    .feature-spec-text {{
+      margin: 0;
+      color: var(--text);
+    }}
+
+    .feature-spec-list {{
+      margin: 0;
+      padding-left: 18px;
+      color: var(--text);
+    }}
+
+    .feature-spec-list li + li {{
+      margin-top: 8px;
+    }}
+
+    .feature-chip-row {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
+
     .feature-meta {{
       display: flex;
       flex-wrap: wrap;
@@ -537,6 +589,10 @@ def report_to_html(report: AnalysisReport) -> str:
           <div class="meta-value">{_escape(report.specs_path)}</div>
         </div>
         <div class="meta-card">
+          <div class="meta-label">Schema</div>
+          <div class="meta-value">{_escape(report.schema_version)}</div>
+        </div>
+        <div class="meta-card">
           <div class="meta-label">Commit</div>
           <div class="meta-value">{_escape(report.commit_hash or "N/A")}</div>
         </div>
@@ -553,6 +609,9 @@ def report_to_html(report: AnalysisReport) -> str:
         {_summary_card(report.different_count, "Different", "var(--different)")}
         {_summary_card(report.not_implemented_count, "Not Implemented", "var(--missing)")}
         {_summary_card(report.not_specified_count, "Not Specified", "var(--unspecified)")}
+        {_summary_card(report.skipped_count, "Skipped", "var(--unspecified)")}
+        {_summary_card(report.inconclusive_count, "Inconclusive", "var(--different)")}
+        {_summary_card(report.analysis_failed_count, "Analysis Failed", "var(--missing)")}
       </div>
     </section>
 
@@ -575,6 +634,9 @@ def report_to_html(report: AnalysisReport) -> str:
           <button class="filter-chip" type="button" data-filter="implemented_differently">Different</button>
           <button class="filter-chip" type="button" data-filter="not_implemented">Missing</button>
           <button class="filter-chip" type="button" data-filter="not_specified">N/A</button>
+          <button class="filter-chip" type="button" data-filter="skipped">Skipped</button>
+          <button class="filter-chip" type="button" data-filter="inconclusive">Inconclusive</button>
+          <button class="filter-chip" type="button" data-filter="analysis_failed">Failed</button>
         </div>
       </div>
       <div class="feature-list">
@@ -671,9 +733,12 @@ def report_to_table(report: AnalysisReport, include_details: bool = False) -> st
     summary = (
         f"Source: {report.source}\n"
         f"Specs: {report.specs_path}\n"
+        f"Schema: {report.schema_version}\n"
         f"Features: {report.total_features} | Criteria: {report.total_criteria} | "
         f"Implemented: {report.implemented_count} | Different: {report.different_count} | "
         f"Not implemented: {report.not_implemented_count} | Not specified: {report.not_specified_count} | "
+        f"Skipped: {report.skipped_count} | Inconclusive: {report.inconclusive_count} | "
+        f"Analysis failed: {report.analysis_failed_count} | "
         f"Global confidence: {round(report.global_confidence * 100)}%"
     )
     details_text = "\n".join(details)
@@ -688,6 +753,9 @@ def _status_label(status: str) -> str:
         "implemented_differently": "Different",
         "not_implemented": "Missing",
         "not_specified": "N/A",
+        "skipped": "Skipped",
+        "inconclusive": "Inconclusive",
+        "analysis_failed": "Failed",
     }
     return labels.get(status, status or "-")
 
@@ -731,6 +799,9 @@ def _render_table_detail(feature_name: str, criteria) -> str:
 
     if criteria.short_explanation:
         lines.append(f"  Summary: {_truncate(criteria.short_explanation, 220)}")
+    lines.append(f"  Analysis mode: {criteria.analysis_mode}")
+    if criteria.error:
+        lines.append(f"  Error: {_truncate(criteria.error, 320)}")
     if criteria.detailed_explanation and criteria.detailed_explanation != criteria.short_explanation:
         lines.append(f"  Detail: {_truncate(criteria.detailed_explanation, 320)}")
     if criteria.referenced_files:
@@ -767,9 +838,7 @@ def _summary_card(value: int, label: str, accent: str = "var(--text)") -> str:
 def _render_feature_card(feature) -> str:
     status = _status_meta(feature.implementation_status)
     criteria_html = "\n".join(_render_criteria(criteria) for criteria in feature.criteria)
-    components = ""
-    if feature.related_components:
-        components = " · Components: " + ", ".join(_escape(component) for component in feature.related_components)
+    description_html = _render_feature_description(feature)
 
     return f"""
     <article class="feature-card" data-feature-status="{_escape(feature.implementation_status)}" style="--status-color: {status['color']}; --status-bg: {status['background']};">
@@ -779,12 +848,12 @@ def _render_feature_card(feature) -> str:
           <span class="badge">{_escape(status['label'])}</span>
         </div>
         <h3 class="feature-title">{_escape(feature.name)}</h3>
-        {_paragraph(feature.description, "feature-description")}
+        {description_html}
         <div class="feature-meta">
           <span>Specs status: <strong>{_escape(feature.status or "Unknown")}</strong></span>
           <span>Priority: <strong>{_escape(feature.priority or "Unknown")}</strong></span>
           <span>Confidence: <strong>{_percent(feature.confidence)}</strong></span>
-          <span>Criteria: <strong>{len(feature.criteria)}</strong></span>{components}
+          <span>Criteria: <strong>{len(feature.criteria)}</strong></span>
         </div>
       </div>
       <div class="feature-body">
@@ -830,9 +899,14 @@ def _render_criteria(criteria) -> str:
             <span class="mini-label">Confidence</span>
             <div>{_percent(criteria.confidence)}</div>
           </div>
+          <div class="mini-card">
+            <span class="mini-label">Analysis mode</span>
+            <div>{_escape(criteria.analysis_mode)}</div>
+          </div>
         </div>
         {_paragraph(criteria.short_explanation, "")}
         {_paragraph(criteria.detailed_explanation, "")}
+        {_paragraph(f"Error: {criteria.error}" if criteria.error else "", "")}
         {files_html}
         {'<div class="evidence">' + evidence_html + '</div>' if evidence_html else ''}
       </div>
@@ -879,6 +953,105 @@ def _build_search_text(criteria, evidence_blocks: list[dict]) -> str:
             ]
         )
     return " ".join(part for part in parts if part)
+
+
+def _render_feature_description(feature) -> str:
+    parsed = _parse_feature_description(feature.description, feature.related_components)
+    blocks = []
+
+    if parsed["summary"]:
+        blocks.append(
+            f"""
+            <section class="feature-spec-block">
+              <span class="feature-spec-label">Summary</span>
+              <p class="feature-spec-text">{_escape(parsed["summary"])}</p>
+            </section>
+            """
+        )
+
+    if parsed["components"]:
+        chips = "".join(f'<span class="file-chip">{_escape(component)}</span>' for component in parsed["components"])
+        blocks.append(
+            f"""
+            <section class="feature-spec-block">
+              <span class="feature-spec-label">Related Components</span>
+              <div class="feature-chip-row">{chips}</div>
+            </section>
+            """
+        )
+
+    if parsed["acceptance_criteria"]:
+        items = "".join(f"<li>{_escape(item)}</li>" for item in parsed["acceptance_criteria"])
+        blocks.append(
+            f"""
+            <section class="feature-spec-block">
+              <span class="feature-spec-label">Acceptance Criteria</span>
+              <ul class="feature-spec-list">{items}</ul>
+            </section>
+            """
+        )
+
+    if blocks:
+        return f'<div class="feature-specs">{"".join(blocks)}</div>'
+
+    return _paragraph(feature.description, "feature-description")
+
+
+def _parse_feature_description(description: str, related_components: list[str]) -> dict[str, list[str] | str]:
+    parsed = {
+        "summary": "",
+        "components": list(related_components or []),
+        "acceptance_criteria": [],
+    }
+
+    if not description:
+        return parsed
+
+    label_pattern = re.compile(
+        r"(?im)(?:^|\n)\s*(Priority|Status|Related Components|Acceptance Criteria):\s*"
+    )
+    matches = list(label_pattern.finditer(description))
+
+    if not matches:
+        parsed["summary"] = " ".join(description.split())
+        return parsed
+
+    intro = description[: matches[0].start()].strip()
+    if intro:
+        parsed["summary"] = " ".join(intro.split())
+
+    for index, match in enumerate(matches):
+        label = match.group(1).lower()
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(description)
+        value = description[start:end].strip()
+        if not value:
+            continue
+
+        if label == "related components":
+            parsed["components"] = _split_feature_components(value) or parsed["components"]
+        elif label == "acceptance criteria":
+            parsed["acceptance_criteria"] = _split_acceptance_criteria(value)
+
+    return parsed
+
+
+def _split_feature_components(value: str) -> list[str]:
+    parts = [part.strip() for part in value.replace("\n", " ").split(",")]
+    return [part for part in parts if part]
+
+
+def _split_acceptance_criteria(value: str) -> list[str]:
+    lines = [line.strip(" -\t") for line in value.splitlines() if line.strip()]
+    if len(lines) > 1:
+        return lines
+
+    normalized = " ".join(value.split())
+    if not normalized:
+        return []
+
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", normalized)
+    return [sentence.strip() for sentence in sentences if sentence.strip()]
 
 
 def _parse_evidence(raw: str) -> list[dict]:
@@ -933,6 +1106,21 @@ def _status_meta(status: str) -> dict:
             "label": "Not Specified",
             "color": "var(--unspecified)",
             "background": "var(--unspecified-bg)",
+        },
+        "skipped": {
+            "label": "Skipped",
+            "color": "var(--unspecified)",
+            "background": "var(--unspecified-bg)",
+        },
+        "inconclusive": {
+            "label": "Inconclusive",
+            "color": "var(--different)",
+            "background": "var(--different-bg)",
+        },
+        "analysis_failed": {
+            "label": "Analysis Failed",
+            "color": "var(--missing)",
+            "background": "var(--missing-bg)",
         },
     }
     return mapping.get(status, mapping["not_specified"])

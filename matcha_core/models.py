@@ -19,6 +19,9 @@ class ImplementationStatus(str, Enum):
     IMPLEMENTED_DIFFERENTLY = "implemented_differently"
     NOT_IMPLEMENTED = "not_implemented"
     NOT_SPECIFIED = "not_specified"
+    SKIPPED = "skipped"
+    INCONCLUSIVE = "inconclusive"
+    ANALYSIS_FAILED = "analysis_failed"
 
 
 @dataclass
@@ -26,11 +29,13 @@ class CriteriaResult:
     description: str
     criteria_id: Optional[str] = None
     referenced_files: List[str] = field(default_factory=list)
-    implementation_status: str = ImplementationStatus.NOT_IMPLEMENTED.value
+    implementation_status: str = ImplementationStatus.INCONCLUSIVE.value
     confidence: float = 0.0
     short_explanation: str = ""
     detailed_explanation: str = ""
     code_snippets: str = ""
+    analysis_mode: str = "model"
+    error: Optional[str] = None
 
 
 @dataclass
@@ -42,7 +47,7 @@ class FeatureResult:
     status: str = ""
     related_components: List[str] = field(default_factory=list)
     criteria: List[CriteriaResult] = field(default_factory=list)
-    implementation_status: str = ImplementationStatus.NOT_IMPLEMENTED.value
+    implementation_status: str = ImplementationStatus.INCONCLUSIVE.value
     confidence: float = 0.0
 
 
@@ -58,4 +63,8 @@ class AnalysisReport:
     different_count: int = 0
     not_implemented_count: int = 0
     not_specified_count: int = 0
+    skipped_count: int = 0
+    inconclusive_count: int = 0
+    analysis_failed_count: int = 0
     global_confidence: float = 0.0
+    schema_version: str = "1.0"

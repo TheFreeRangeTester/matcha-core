@@ -11,6 +11,40 @@ from .models import ImplementationStatus
 logger = logging.getLogger(__name__)
 
 
+def _exception_mentions_parameter(exc: Exception, parameter: str) -> bool:
+    """Return whether a provider error explicitly names a rejected parameter."""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error", body)
+        if isinstance(error, dict) and error.get("param") == parameter:
+            return True
+    return parameter.lower() in str(exc).lower()
+
+
+def default_reasoning_effort(model: str) -> Optional[str]:
+    """Use a bounded reasoning default for OpenAI reasoning-model families."""
+    normalized = (model or "").lower()
+    if normalized.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4")):
+        return "low"
+    return None
+
+
+def _completion_metadata(response: Any) -> Dict[str, Any]:
+    choices = getattr(response, "choices", None) or []
+    finish_reason = getattr(choices[0], "finish_reason", None) if choices else None
+    usage = getattr(response, "usage", None)
+    usage_data: Dict[str, Any] = {}
+    if usage is not None:
+        if hasattr(usage, "model_dump"):
+            usage_data = usage.model_dump(exclude_none=True)
+        else:
+            for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                value = getattr(usage, field, None)
+                if value is not None:
+                    usage_data[field] = value
+    return {"finish_reason": finish_reason, "usage": usage_data}
+
+
 class ResponseParseError(ValueError):
     pass
 
@@ -21,6 +55,9 @@ class OpenAICompatibleEvaluator:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         model: str = "gpt-4o-mini",
+        timeout: float = 60.0,
+        max_retries: int = 1,
+        reasoning_effort: Optional[str] = None,
     ):
         normalized_base_url = normalize_base_url(base_url)
         resolved_api_key = api_key or default_api_key_for_base_url(normalized_base_url)
@@ -33,8 +70,14 @@ class OpenAICompatibleEvaluator:
         self.client = OpenAI(
             api_key=resolved_api_key,
             base_url=normalized_base_url,
+            timeout=timeout,
+            max_retries=max_retries,
         )
         self.model = model
+        self._completion_token_parameter = "max_tokens"
+        self._supports_temperature = True
+        self.reasoning_effort = reasoning_effort or default_reasoning_effort(model)
+        self.last_json_completion_metadata: list[Dict[str, Any]] = []
 
     @classmethod
     def from_env(
@@ -43,6 +86,9 @@ class OpenAICompatibleEvaluator:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
+        timeout: float = 60.0,
+        max_retries: int = 1,
+        reasoning_effort: Optional[str] = None,
     ) -> "OpenAICompatibleEvaluator":
         provider = provider.lower()
 
@@ -50,7 +96,14 @@ class OpenAICompatibleEvaluator:
             resolved_base_url = base_url or os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434/v1"
             resolved_model = model or os.environ.get("OLLAMA_MODEL") or "llama3.2"
             resolved_api_key = api_key or os.environ.get("OLLAMA_API_KEY") or "ollama"
-            return cls(api_key=resolved_api_key, base_url=resolved_base_url, model=resolved_model)
+            return cls(
+                api_key=resolved_api_key,
+                base_url=resolved_base_url,
+                model=resolved_model,
+                timeout=timeout,
+                max_retries=max_retries,
+                reasoning_effort=reasoning_effort,
+            )
 
         resolved_api_key = (
             api_key
@@ -68,7 +121,15 @@ class OpenAICompatibleEvaluator:
             or os.environ.get("OPENAI_MODEL")
             or "gpt-4o-mini"
         )
-        return cls(api_key=resolved_api_key, base_url=resolved_base_url, model=resolved_model)
+        resolved_reasoning_effort = reasoning_effort or os.environ.get("OPENAI_REASONING_EFFORT")
+        return cls(
+            api_key=resolved_api_key,
+            base_url=resolved_base_url,
+            model=resolved_model,
+            timeout=timeout,
+            max_retries=max_retries,
+            reasoning_effort=resolved_reasoning_effort,
+        )
 
     def evaluate_criteria(
         self,
@@ -87,11 +148,16 @@ class OpenAICompatibleEvaluator:
             if debug is not None:
                 debug["analysis_mode"] = "no_code_context"
             return {
-                "status": ImplementationStatus.NOT_IMPLEMENTED.value,
+                "status": ImplementationStatus.INCONCLUSIVE.value,
                 "confidence": 0.0,
-                "short_explanation": "No code files found to analyze",
-                "detailed_explanation": "The repository does not contain relevant code files to evaluate this criteria.",
+                "short_explanation": "No relevant code context was found",
+                "detailed_explanation": (
+                    "Matcha could not retrieve code relevant enough to evaluate this criterion safely. "
+                    "This is inconclusive, not proof that the behavior is missing."
+                ),
                 "code_snippets": "",
+                "analysis_mode": "no_code_context",
+                "error": None,
             }
 
         try:
@@ -103,6 +169,8 @@ class OpenAICompatibleEvaluator:
                 if debug is not None:
                     debug["analysis_mode"] = "parsed"
                     debug["parse_source"] = parsed.get("_parse_source", "unknown")
+                parsed["analysis_mode"] = "model"
+                parsed["error"] = None
                 return parsed
             except ResponseParseError as parse_exc:
                 logger.warning("Primary model response could not be parsed; attempting JSON repair pass.")
@@ -116,26 +184,64 @@ class OpenAICompatibleEvaluator:
                     if debug is not None:
                         debug["analysis_mode"] = "parsed_after_repair"
                         debug["parse_source"] = parsed.get("_parse_source", "unknown")
+                    parsed["analysis_mode"] = "model_repaired"
+                    parsed["error"] = None
                     return parsed
                 except ResponseParseError as repair_exc:
                     if debug is not None:
                         debug["repair_parse_error"] = str(repair_exc)
-                        debug["analysis_mode"] = "fallback_heuristic"
-                    return self._fallback_evaluation(
-                        criteria_description,
-                        code_context,
-                        f"{parse_exc}; retry failed: {repair_exc}",
+                        debug["analysis_mode"] = "analysis_failed"
+                    return self._analysis_failed_evaluation(
+                        f"Model response could not be parsed: {parse_exc}; repair failed: {repair_exc}"
                     )
         except Exception as exc:
             if debug is not None:
-                debug["analysis_mode"] = "fallback_heuristic"
+                debug["analysis_mode"] = "analysis_failed"
                 debug["exception"] = str(exc)
-            return self._fallback_evaluation(criteria_description, code_context, str(exc))
+            return self._analysis_failed_evaluation(f"Model evaluation failed: {exc}")
+
+    def create_json_completion(
+        self,
+        messages: list[dict[str, str]],
+        max_tokens: int = 2000,
+        json_schema: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Return text from an OpenAI-compatible completion that prefers JSON mode."""
+        response_format = None
+        if json_schema is not None:
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "matcha_structured_output",
+                    "strict": True,
+                    "schema": json_schema,
+                },
+            }
+        response = self._create_completion(
+            messages=messages,
+            prefer_json_object=json_schema is None,
+            max_tokens=max_tokens,
+            response_format=response_format,
+        )
+        metadata = _completion_metadata(response)
+        attempts = [metadata]
+        content = response.choices[0].message.content or ""
+
+        if not content.strip() and metadata.get("finish_reason") == "length":
+            response = self._create_completion(
+                messages=messages,
+                prefer_json_object=json_schema is None,
+                max_tokens=min(max_tokens * 2, 32_000),
+                response_format=response_format,
+            )
+            attempts.append(_completion_metadata(response))
+            content = response.choices[0].message.content or ""
+
+        self.last_json_completion_metadata = attempts
+        return content
 
     def _call_model(self, criteria: str, code: str, feature: str) -> str:
-        system_prompt = """You are a meticulous software auditor. You MUST analyze code step-by-step before making conclusions.
-
-CRITICAL: Use Chain of Thought reasoning. NEVER jump to conclusions without first examining the code carefully.
+        system_prompt = """You are a meticulous software auditor. Examine the supplied code carefully before making conclusions.
 
 ANALYSIS PROCESS (you must follow these steps):
 1. SCAN: List the files/sections you received
@@ -212,7 +318,7 @@ Respond in this exact JSON format:
     ]
 }}
 
-CRITICAL: Fill in the "reasoning" section FIRST. Your status MUST be consistent with your reasoning.
+CRITICAL: Provide a concise evidence rationale in the "reasoning" section. Your status MUST be consistent with your reasoning.
 - If reasoning.matches_requirement is "yes" → status must be "implemented_as_expected"
 - If reasoning.matches_requirement is "partial" → status must be "implemented_differently"
 - If reasoning.matches_requirement is "no" or relevant_code_found is "none" → status must be "not_implemented"
@@ -248,7 +354,7 @@ IMPORTANT:
         )
 
         result = response.choices[0].message.content or ""
-        logger.info("LLM response (first 500 chars): %s", result[:500])
+        logger.info("LLM response received: %s chars", len(result))
         return result
 
     def _repair_json_response(self, raw_response: str) -> str:
@@ -270,38 +376,99 @@ IMPORTANT:
         messages: list[dict[str, str]],
         prefer_json_object: bool = False,
         max_tokens: int = 2000,
+        response_format: Optional[Dict[str, Any]] = None,
     ):
+        token_parameter = getattr(self, "_completion_token_parameter", "max_tokens")
         kwargs: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "temperature": 0.0,
-            "max_tokens": max_tokens,
+            token_parameter: max_tokens,
         }
+        if getattr(self, "_supports_temperature", True):
+            kwargs["temperature"] = 0.0
+        reasoning_effort = getattr(self, "reasoning_effort", None)
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
 
-        if prefer_json_object:
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+        elif prefer_json_object:
             kwargs["response_format"] = {"type": "json_object"}
 
-        try:
-            return self.client.chat.completions.create(**kwargs)
-        except Exception:
-            # Some OpenAI-compatible backends (including certain Ollama setups)
-            # do not support `response_format`; retry without it.
-            if prefer_json_object:
-                kwargs.pop("response_format", None)
+        # OpenAI-compatible providers do not expose one perfectly uniform
+        # request surface. Retry only when the provider explicitly rejects an
+        # optional or renamed parameter, and remember the capability for later
+        # calls made by this evaluator instance.
+        for _attempt in range(5):
+            try:
                 return self.client.chat.completions.create(**kwargs)
-            raise
+            except Exception as exc:
+                status_code = getattr(exc, "status_code", None)
+                if status_code not in {400, 404, 422}:
+                    raise
+
+                if "max_tokens" in kwargs and _exception_mentions_parameter(exc, "max_tokens"):
+                    token_budget = kwargs.pop("max_tokens")
+                    kwargs["max_completion_tokens"] = token_budget
+                    self._completion_token_parameter = "max_completion_tokens"
+                    continue
+
+                if "temperature" in kwargs and _exception_mentions_parameter(exc, "temperature"):
+                    kwargs.pop("temperature")
+                    self._supports_temperature = False
+                    continue
+
+                if "reasoning_effort" in kwargs and _exception_mentions_parameter(exc, "reasoning_effort"):
+                    kwargs.pop("reasoning_effort")
+                    self.reasoning_effort = None
+                    continue
+
+                # Some compatible backends (including certain Ollama setups)
+                # reject response_format even though they implement the rest of
+                # Chat Completions.
+                if "response_format" in kwargs:
+                    kwargs.pop("response_format")
+                    continue
+
+                raise
+
+        raise RuntimeError("Provider compatibility retries were exhausted")
 
     def _parse_response(self, response: str) -> Dict[str, Any]:
         try:
             json_match = extract_json_payload(response)
             result = json.loads(json_match)
+            self._validate_result_payload(result)
             return self._normalize_result_payload(result)
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            extracted = self._extract_structured_fields_from_text(response or "")
-            if extracted:
-                return self._normalize_result_payload(extracted)
-            logger.warning("Failed to parse model response as JSON. Raw response (first 500 chars): %s", (response or "")[:500])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError, ResponseParseError) as exc:
+            logger.warning("Failed to parse model response (%s chars): %s", len(response or ""), exc)
             raise ResponseParseError(f"Failed to parse LLM response: {exc}") from exc
+
+    def _validate_result_payload(self, result: Dict[str, Any]) -> None:
+        if not isinstance(result, dict):
+            raise ResponseParseError("Model response must be a JSON object")
+
+        required_fields = {
+            "status": str,
+            "confidence": (int, float),
+            "short_explanation": str,
+            "detailed_explanation": str,
+            "evidence": list,
+        }
+        for field_name, expected_type in required_fields.items():
+            if field_name not in result:
+                raise ResponseParseError(f"Model response is missing required field: {field_name}")
+            if not isinstance(result[field_name], expected_type):
+                raise ResponseParseError(f"Model response field has invalid type: {field_name}")
+
+        model_statuses = {
+            ImplementationStatus.IMPLEMENTED_AS_EXPECTED.value,
+            ImplementationStatus.IMPLEMENTED_DIFFERENTLY.value,
+            ImplementationStatus.NOT_IMPLEMENTED.value,
+            ImplementationStatus.NOT_SPECIFIED.value,
+        }
+        if result["status"] not in model_statuses:
+            raise ResponseParseError(f"Model response has invalid status: {result['status']}")
 
     def _normalize_result_payload(self, result: Dict[str, Any]) -> Dict[str, Any]:
         status = self._normalize_status(result.get("status"))
@@ -501,11 +668,27 @@ IMPORTANT:
             explanation = "Low keyword match in code (heuristic analysis)"
 
         return {
-            "status": status,
-            "confidence": confidence,
-            "short_explanation": explanation,
-            "detailed_explanation": f"Fallback analysis used due to: {error}. Keywords analyzed: {', '.join(keywords[:5])}",
+            "status": ImplementationStatus.INCONCLUSIVE.value,
+            "confidence": 0.0,
+            "short_explanation": "Heuristic fallback is not authoritative",
+            "detailed_explanation": (
+                f"A legacy heuristic suggested '{status}' at confidence {confidence:.2f}, but Matcha does not "
+                f"treat heuristics as gate-safe evidence. Cause: {error}. Keywords: {', '.join(keywords[:5])}"
+            ),
             "code_snippets": "",
+            "analysis_mode": "heuristic_non_authoritative",
+            "error": error,
+        }
+
+    def _analysis_failed_evaluation(self, error: str) -> Dict[str, Any]:
+        return {
+            "status": ImplementationStatus.ANALYSIS_FAILED.value,
+            "confidence": 0.0,
+            "short_explanation": "The criterion could not be evaluated",
+            "detailed_explanation": error,
+            "code_snippets": "",
+            "analysis_mode": "analysis_failed",
+            "error": error,
         }
 
     def _extract_keywords(self, text: str) -> list[str]:

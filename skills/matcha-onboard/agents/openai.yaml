@@ -1,0 +1,7 @@
+interface:
+  display_name: "Matcha Onboard"
+  short_description: "Build evidence-backed Matcha specs drafts"
+  default_prompt: "Use $matcha-onboard to create and review initial Matcha specs for this repository."
+
+policy:
+  allow_implicit_invocation: true
